@@ -1,18 +1,19 @@
-import urllib
 from urllib.parse import urljoin, urlparse
-from bs4 import BeautifulSoup
-import requests
+from collections import defaultdict
 import mimetypes
 import os
-from collections import defaultdict
-
+import asyncio
+from playwright.async_api import async_playwright
+import requests
 class WebCrawler:
     def __init__(self):
         self.visited_urls = set()
         self.files_by_type = defaultdict(list)
         self.errors = []
         self.session = requests.Session()
-        
+        self.session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (compatible; MyCrawler/1.0; +https://example.com/bot)'
+})
         # Add common file extensions
         mimetypes.add_type('application/pdf', '.pdf')
         mimetypes.add_type('application/msword', '.doc')
@@ -49,55 +50,60 @@ class WebCrawler:
                     return 'Applications'
             return f'Other ({ext})'
         return 'Webpages'
-
+    def normalize_url(self, url):
+        parsed = urlparse(url)
+        return parsed._replace(fragment="", query="").geturl()
     def is_valid_url(self, url, start_domain):
         """Check if URL is valid and belongs to start domain"""
         try:
             parsed = urlparse(url)
-            return bool(parsed.netloc) and parsed.netloc == start_domain
+            return parsed.scheme in ['http', 'https'] and start_domain in parsed.netloc
         except:
             return False
 
-    def crawl(self, start_url, max_pages=100):
-        """Main crawling function"""
+    async def crawl(self, start_url, max_pages=100):
         start_domain = urlparse(start_url).netloc
         urls_to_visit = [start_url]
 
-        try:
-            while urls_to_visit and len(self.visited_urls) < max_pages:
-                url = urls_to_visit.pop(0)
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
 
-                if url in self.visited_urls:
-                    continue
+            try:
+                while urls_to_visit and len(self.visited_urls) < max_pages:
+                    url = urls_to_visit.pop(0)
+                    norm_url = self.normalize_url(url)
 
-                self.visited_urls.add(url)
+                    if norm_url in self.visited_urls:
+                        continue
 
-                try:
-                    # Use session for better performance
-                    response = self.session.get(url, timeout=10)
-                    response.raise_for_status()
+                    try:
+                        await page.goto(norm_url, timeout=100000, wait_until='networkidle')
+                        await page.evaluate("""() => {
+                            window.scrollBy(0, document.body.scrollHeight);
+                        }""")
+                        self.visited_urls.add(norm_url)
 
-                    # Categorize the current URL
-                    file_type = self.get_file_type(url)
-                    self.files_by_type[file_type].append(url)
+                        self.files_by_type[self.get_file_type(norm_url)].append(norm_url)
 
-                    # Only parse HTML content for links
-                    if 'text/html' in response.headers.get('Content-Type', '').lower():
-                        soup = BeautifulSoup(response.text, 'html.parser')
-
-                        # Find all links
-                        for link in soup.find_all(['a', 'link', 'script', 'img']):
-                            href = link.get('href') or link.get('src')
+                        anchors = await page.query_selector_all("a[href]")
+                        links = []
+                        for anchor in anchors:
+                            href = await anchor.get_attribute("href")
                             if href:
-                                full_url = urljoin(url, href)
-                                if self.is_valid_url(full_url, start_domain):
-                                    urls_to_visit.append(full_url)
+                                absolute_url = urljoin(norm_url, href)
+                                if self.is_valid_url(absolute_url, start_domain) and absolute_url not in self.visited_urls:
+                                    links.append(self.normalize_url(absolute_url))
+                        for link in links:
+                            link = self.normalize_url(link)
+                            if self.is_valid_url(link, start_domain) and link not in self.visited_urls:
+                                urls_to_visit.append(link)
 
-                except Exception as e:
-                    self.errors.append(f"Error crawling {url}: {str(e)}")
+                    except Exception as e:
+                        self.errors.append(f"Error at {url}: {e}")
 
-        except KeyboardInterrupt:
-            print("\nCrawling interrupted by user")
+            finally:
+                await browser.close()
 
         return self.generate_report()
 
@@ -132,12 +138,11 @@ def print_tree(tree, prefix="  "):
         print(f"{prefix}- {key}/")
         print_tree(sub_tree, prefix + "   ")
 
-def main():
-    url = input("Enter website to crawl: ")
+async def main():
+    url = input("Enter website to crawl: ").strip()
     max_pages = int(input("Enter maximum number of pages to crawl (default 100): ") or 100)
-
     crawler = WebCrawler()
-    results = crawler.crawl(url, max_pages)
+    results = await crawler.crawl(url, max_pages)
 
     # Print results
     print("\n=== Crawling Summary ===")
@@ -148,8 +153,11 @@ def main():
         print(f"{file_type}: {len(files)} files")
 
         url_tree = build_url_tree(files)
-        print_tree(url_tree, prefix="  ")  # Print hierarchy
-
+        print_tree(url_tree, prefix="  ") 
+    if results['errors']:
+        print("\n=== Errors ===")
+        for error in results['errors']:
+            print(error)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main()) 
